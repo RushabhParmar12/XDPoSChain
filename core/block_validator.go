@@ -17,12 +17,16 @@
 package core
 
 import (
+	"encoding/hex"
 	"fmt"
-
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"sort"
 )
 
 // BlockValidator is responsible for validating block headers, uncles and
@@ -70,6 +74,51 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 	if hash := types.DeriveSha(block.Transactions()); hash != header.TxHash {
 		return fmt.Errorf("transaction root hash mismatch: have %x, want %x", hash, header.TxHash)
 	}
+
+	engine, _ := v.engine.(*XDPoS.XDPoS)
+	XinFinXService := engine.GetXinFinXService()
+
+	currentState, err := v.bc.State()
+	if err != nil {
+		return err
+	}
+
+	// validate matchedOrder txs
+	processedHashes := []common.Hash{}
+	// clear the previous dry-run cache
+	if XinFinXService != nil {
+		XinFinXService.GetDB().InitDryRunMode()
+	}
+	txs := []*types.Transaction{}
+
+	for _, tx := range block.Transactions() {
+		if tx.IsMatchingTransaction() {
+			txs = append(txs, tx)
+		}
+	}
+
+	sort.Slice(txs, func(i, j int) bool {
+		return txs[i].Timestamp() <= txs[j].Timestamp()
+	})
+
+	for _, tx := range txs {
+		if tx.IsMatchingTransaction() {
+			if XinFinXService == nil {
+				log.Error("XinFinx not found")
+				return XinFinx.ErrXinFinXServiceNotFound
+			}
+			log.Debug("verify matching transaction")
+			hashes, err := v.validateMatchingOrder(XinFinXService, currentState, tx)
+			if err != nil {
+				return err
+			}
+			processedHashes = append(processedHashes, hashes...)
+		}
+	}
+	hashNoValidator := block.HashNoValidator()
+	if _, ok := v.bc.processedOrderHashes.Get(hashNoValidator); !ok && len(processedHashes) > 0 {
+		v.bc.processedOrderHashes.Add(block.HashNoValidator(), processedHashes)
+	}
 	return nil
 }
 
@@ -99,6 +148,62 @@ func (v *BlockValidator) ValidateState(block, parent *types.Block, statedb *stat
 		return fmt.Errorf("invalid merkle root (remote: %x local: %x)", header.Root, root)
 	}
 	return nil
+}
+
+func (v *BlockValidator) validateMatchingOrder(XinFinXService *XinFinx.XinFinX, currentState *state.StateDB, tx *types.Transaction) ([]common.Hash, error) {
+	txMatches, err := XinFinx.DecodeTxMatchesBatch(tx.Data())
+	if err != nil {
+		return []common.Hash{}, fmt.Errorf("transaction match is corrupted. Failed to decode txMatchesBatch. Error: %s", err.Error())
+	}
+	processedHashes := []common.Hash{}
+	log.Debug("verify matching transaction found a TxMatches Batch", "numTxMatches", len(txMatches))
+
+	for _, txMatch := range txMatches {
+		// verify orderItem
+		order, err := txMatch.DecodeOrder()
+		if err != nil {
+			return []common.Hash{}, fmt.Errorf("transaction match is corrupted. Failed decode order. Error: %s ", err.Error())
+		}
+		if XinFinXService.ExistProcessedOrderHash(order.Hash) {
+			return []common.Hash{}, fmt.Errorf("This order has been processed: Hash: %s ", hex.EncodeToString(order.Hash.Bytes()))
+		}
+		log.Debug("process tx match", "order", order)
+
+		processedHashes = append(processedHashes, order.Hash)
+
+		// SDK node doesn't need to run ME
+		if XinFinXService.IsSDKNode() {
+			log.Debug("SDK node ignore running matching engine")
+			continue
+		}
+		if err := order.VerifyMatchedOrder(currentState); err != nil {
+			return []common.Hash{}, err
+		}
+
+		ob, err := XinFinXService.GetOrderBook(order.PairName, true)
+		// if orderbook of this pairName has been updated by previous tx in this block, use it
+
+		if err != nil {
+			return []common.Hash{}, err
+		}
+
+		// verify old state: orderbook hash, bidTree hash, askTree hash
+		if err := txMatch.VerifyOldXinFinXState(ob); err != nil {
+			return []common.Hash{}, err
+		}
+
+		// process Matching Engine
+		if _, _, err := ob.ProcessOrder(order, true, true); err != nil {
+			return []common.Hash{}, err
+		}
+
+		// verify new state
+		if err := txMatch.VerifyNewXinFinXState(ob); err != nil {
+			return []common.Hash{}, err
+		}
+	}
+
+	return processedHashes, nil
 }
 
 // CalcGasLimit computes the gas limit of the next block after parent.
@@ -131,3 +236,4 @@ func CalcGasLimit(parent *types.Block) uint64 {
 	}
 	return limit
 }
+
